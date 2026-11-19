@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import hmac
 import json
-import sqlite3
 
 from . import payments, payouts
-from .db import transaction
+from psycopg.types.json import Jsonb
+
+from .db import Connection, transaction
 from .provider import sign
 
 PAYMENT_EVENTS = {
@@ -44,7 +45,7 @@ def verify(body: bytes, signature: str, secret: str) -> None:
         raise InvalidSignature("webhook signature does not match")
 
 
-def handle(conn: sqlite3.Connection, body: bytes, signature: str, secret: str) -> str:
+def handle(conn: Connection, body: bytes, signature: str, secret: str) -> str:
     """Process one webhook. Returns an outcome label. Raises only for bad signatures.
 
     Outcomes: applied, no_change, duplicate, stale, needs_review, unknown, ignored_type
@@ -56,8 +57,8 @@ def handle(conn: sqlite3.Connection, body: bytes, signature: str, secret: str) -
     with transaction(conn):
         inserted = conn.execute(
             "INSERT INTO webhook_events (event_id, type, payload, outcome) "
-            "VALUES (?, ?, ?, 'processing') ON CONFLICT (event_id) DO NOTHING",
-            (event_id, event_type, body.decode()),
+            "VALUES (%s, %s, %s, 'processing') ON CONFLICT (event_id) DO NOTHING",
+            (event_id, event_type, Jsonb(event)),
         ).rowcount
         if not inserted:
             return "duplicate"
@@ -68,11 +69,11 @@ def handle(conn: sqlite3.Connection, body: bytes, signature: str, secret: str) -
             outcome = _apply_payout(conn, PAYOUT_EVENTS[event_type], event["data"], event_type)
         else:
             outcome = "ignored_type"
-        conn.execute("UPDATE webhook_events SET outcome = ? WHERE event_id = ?", (outcome, event_id))
+        conn.execute("UPDATE webhook_events SET outcome = %s WHERE event_id = %s", (outcome, event_id))
     return outcome
 
 
-def _apply_payment(conn: sqlite3.Connection, target: str, data: dict, event_type: str) -> str:
+def _apply_payment(conn: Connection, target: str, data: dict, event_type: str) -> str:
     payment = payments.find_by_provider_ref(conn, data["ref"])
     if payment is None:
         return "unknown"
@@ -88,7 +89,7 @@ def _apply_payment(conn: sqlite3.Connection, target: str, data: dict, event_type
     return "applied" if changed else "no_change"
 
 
-def _apply_payout(conn: sqlite3.Connection, target: str, data: dict, event_type: str) -> str:
+def _apply_payout(conn: Connection, target: str, data: dict, event_type: str) -> str:
     payout = payouts.find_by_reference(conn, data["ref"], data.get("reference"))
     if payout is None:
         return "unknown"
@@ -96,5 +97,5 @@ def _apply_payout(conn: sqlite3.Connection, target: str, data: dict, event_type:
         return "needs_review"
     if payout["provider_ref"] is None:
         # Our submit call timed out, but the provider did create the payout.
-        conn.execute("UPDATE payouts SET provider_ref = ? WHERE id = ?", (data["ref"], payout["id"]))
+        conn.execute("UPDATE payouts SET provider_ref = %s WHERE id = %s", (data["ref"], payout["id"]))
     return payouts.apply_remote_status(conn, payout["id"], target, source=f"webhook:{event_type}")

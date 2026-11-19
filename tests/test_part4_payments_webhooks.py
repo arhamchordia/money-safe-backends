@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import psycopg
 
 import pytest
+
+from conftest import scalar
 
 from moneysafe import outbox, payments, webhooks
 from moneysafe.ledger import balance, shop_wallet, trial_balance
@@ -65,7 +67,7 @@ def test_refund_reverses_the_money(conn, payment):
 
 
 def test_audit_log_is_append_only(conn, payment):
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+    with pytest.raises(psycopg.Error, match="append-only"):
         conn.execute("DELETE FROM payment_events")
 
 
@@ -117,7 +119,7 @@ def test_failed_after_captured_needs_a_human(conn, payment, provider):
 def test_unknown_payment_is_recorded_not_crashed(conn, provider):
     ref = provider.create_payment(500)
     assert webhooks.handle(conn, *provider.event(ref, "payment.captured"), SECRET) == "unknown"
-    assert conn.execute("SELECT outcome FROM webhook_events").fetchone()[0] == "unknown"
+    assert scalar(conn, "SELECT outcome FROM webhook_events") == "unknown"
 
 
 # Chapter 4.3: the outbox ---------------------------------------------------------------
@@ -157,8 +159,8 @@ def test_webhook_payload_is_stored_for_audit(conn, payment, provider):
     _, ref = payment
     body, sig = provider.event(ref, "payment.captured", event_id="evt_audit")
     webhooks.handle(conn, body, sig, SECRET)
-    stored = conn.execute("SELECT payload FROM webhook_events WHERE event_id = 'evt_audit'").fetchone()[0]
-    assert json.loads(stored)["data"]["ref"] == ref
+    stored = scalar(conn, "SELECT payload FROM webhook_events WHERE event_id = 'evt_audit'")
+    assert stored["data"]["ref"] == ref
 
 
 def test_platform_fee_defaults_to_zero(conn, provider):
@@ -166,3 +168,31 @@ def test_platform_fee_defaults_to_zero(conn, provider):
     pid = payments.create_payment(conn, 7, 10_000, provider_ref=ref)
     payments.transition(conn, pid, "captured", source="test")
     assert balance(conn, shop_wallet(7)) == 10_000
+
+
+def test_two_workers_never_take_the_same_message(dsn, conn):
+    """FOR UPDATE SKIP LOCKED: parallel workers split the outbox between them."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+    from moneysafe.db import connect
+
+    for i in range(40):
+        outbox.enqueue(conn, "sms.send", {"n": i})
+    seen: list[int] = []
+    lock = threading.Lock()
+
+    def handler(mid, topic, data):
+        time.sleep(0.002)
+        with lock:
+            seen.append(mid)
+
+    def worker(_):
+        with connect(dsn) as c:
+            return outbox.process_batch(c, handler, limit=100)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(worker, range(4)))
+
+    assert len(seen) == 40 and len(set(seen)) == 40      # every message once, none twice
+    assert outbox.pending(conn) == []

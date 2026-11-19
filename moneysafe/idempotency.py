@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from typing import Any, Callable
 
-from .db import transaction
+from psycopg.types.json import Jsonb
+
+from .db import Connection, transaction
 
 
 class IdempotencyConflict(Exception):
@@ -43,16 +44,16 @@ def fingerprint(request: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def run_once(conn: sqlite3.Connection, key: str, request: dict[str, Any],
-             work: Callable[[sqlite3.Connection], dict[str, Any]],
+def run_once(conn: Connection, key: str, request: dict[str, Any],
+             work: Callable[[Connection], dict[str, Any]],
              store_failures: tuple[type[Exception], ...] = ()) -> tuple[dict[str, Any], bool]:
     """Run `work` at most once per key. Returns (response, replayed).
 
     - First call: inserts the key, runs the work, saves the response, commits all together.
     - Repeat with the same request: returns the saved response, does no work.
     - Repeat with a different request: raises IdempotencyConflict.
-    - Two calls at the same moment: BEGIN IMMEDIATE makes the second wait until
-      the first commits, then it sees the saved response.
+    - Two calls at the same moment: the second INSERT waits on the unique key until
+      the first commits, then finds the saved response.
     - Work raises an exception listed in `store_failures`: the work is rolled
       back, the failure is saved under the key, and StoredFailure is raised now
       and on every later replay.
@@ -63,17 +64,17 @@ def run_once(conn: sqlite3.Connection, key: str, request: dict[str, Any],
 
     with transaction(conn):
         inserted = conn.execute(
-            "INSERT INTO idempotency_keys (key, request_hash) VALUES (?, ?) "
+            "INSERT INTO idempotency_keys (key, request_hash) VALUES (%s, %s) "
             "ON CONFLICT (key) DO NOTHING",
             (key, request_hash),
         ).rowcount
         if not inserted:
             row = conn.execute(
-                "SELECT request_hash, response FROM idempotency_keys WHERE key = ?", (key,)
+                "SELECT request_hash, response FROM idempotency_keys WHERE key = %s", (key,)
             ).fetchone()
             if row["request_hash"] != request_hash:
                 raise IdempotencyConflict(f"key {key!r} was used for a different request")
-            saved = json.loads(row["response"])
+            saved = row["response"]
             if saved.get("ok") is False:
                 raise StoredFailure(saved, replayed=True)
             return saved, True
@@ -83,11 +84,11 @@ def run_once(conn: sqlite3.Connection, key: str, request: dict[str, Any],
                 response = work(conn)
         except store_failures as exc:
             failure = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
-            conn.execute("UPDATE idempotency_keys SET response = ? WHERE key = ?",
-                         (json.dumps(failure), key))
+            conn.execute("UPDATE idempotency_keys SET response = %s WHERE key = %s",
+                         (Jsonb(failure), key))
         else:
-            conn.execute("UPDATE idempotency_keys SET response = ? WHERE key = ?",
-                         (json.dumps(response), key))
+            conn.execute("UPDATE idempotency_keys SET response = %s WHERE key = %s",
+                         (Jsonb(response), key))
 
     if failure is not None:
         raise StoredFailure(failure, replayed=False)

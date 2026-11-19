@@ -17,11 +17,10 @@ from __future__ import annotations
 
 import csv
 import io
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .db import transaction
+from .db import Connection, transaction
 from .ledger import Posting, post_entry, trial_balance
 from .money import to_paise
 from .provider import BankCredit
@@ -104,7 +103,7 @@ def parse_settlement(csv_text: str) -> list[SettlementLine]:
     return lines
 
 
-def reconcile(conn: sqlite3.Connection, lines: list[SettlementLine], bank: BankCredit) -> ReconReport:
+def reconcile(conn: Connection, lines: list[SettlementLine], bank: BankCredit) -> ReconReport:
     if not lines:
         raise ValueError("empty settlement report")
     report = ReconReport(settlement_id=lines[0].settlement_id, utr=bank.utr, lines=lines,
@@ -112,11 +111,11 @@ def reconcile(conn: sqlite3.Connection, lines: list[SettlementLine], bank: BankC
                          ledger_trial_balance=trial_balance(conn))
     for line in lines:
         ref = line.provider_ref
-        if conn.execute("SELECT 1 FROM settlement_items WHERE provider_ref = ?", (ref,)).fetchone():
+        if conn.execute("SELECT 1 FROM settlement_items WHERE provider_ref = %s", (ref,)).fetchone():
             report.already_settled[ref] = line.amount_paise
             continue
         ours = conn.execute(
-            "SELECT amount_paise FROM payments WHERE provider_ref = ? AND status = 'captured'", (ref,)
+            "SELECT amount_paise FROM payments WHERE provider_ref = %s AND status = 'captured'", (ref,)
         ).fetchone()
         if ours is None:
             report.not_captured_by_us[ref] = line.amount_paise
@@ -127,7 +126,7 @@ def reconcile(conn: sqlite3.Connection, lines: list[SettlementLine], bank: BankC
     return report
 
 
-def post_settlement(conn: sqlite3.Connection, report: ReconReport) -> int:
+def post_settlement(conn: Connection, report: ReconReport) -> int:
     """Record a clean settlement: clearing goes down, bank and provider fees go up."""
     if not report.is_clean:
         raise SettlementNotClean("; ".join(report.problems))
@@ -142,16 +141,17 @@ def post_settlement(conn: sqlite3.Connection, report: ReconReport) -> int:
         # Primary keys on settlement_id, utr and provider_ref make a replay fail loudly.
         conn.execute(
             "INSERT INTO settlements (settlement_id, utr, gross_paise, fees_paise, net_paise, entry_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             (report.settlement_id, report.utr, report.gross_paise, report.fees_paise,
              report.bank_credit_paise, entry_id),
         )
-        conn.executemany("INSERT INTO settlement_items (provider_ref, settlement_id) VALUES (?, ?)",
-                         [(ref, report.settlement_id) for ref in report.matched])
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO settlement_items (provider_ref, settlement_id) VALUES (%s, %s)",
+                            [(ref, report.settlement_id) for ref in report.matched])
     return entry_id
 
 
-def overdue_captures(conn: sqlite3.Connection, as_of: datetime,
+def overdue_captures(conn: Connection, as_of: datetime,
                      expected_days: int = 2) -> dict[str, int]:
     """Captured payments still unsettled after the expected cycle.
 
@@ -166,4 +166,4 @@ def overdue_captures(conn: sqlite3.Connection, as_of: datetime,
     ).fetchall()
     cutoff = as_of - timedelta(days=expected_days)
     return {r["provider_ref"]: r["amount_paise"] for r in rows
-            if datetime.fromisoformat(r["captured_at"]) < cutoff}
+            if r["captured_at"] < cutoff}

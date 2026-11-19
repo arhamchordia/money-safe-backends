@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -94,7 +94,7 @@ def test_replaying_a_posted_settlement_fails_loudly(conn, provider, day):
     csv_text, bank = provider.settle(refs)
     report = reconcile(conn, parse_settlement(csv_text), bank)
     post_settlement(conn, report)
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(psycopg.Error):
         post_settlement(conn, report)
     assert balance(conn, "bank:main") == bank.amount_paise    # the replay rolled back
 

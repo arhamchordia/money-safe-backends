@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
+from conftest import scalar
 
 from moneysafe.db import connect
 from moneysafe.idempotency import IdempotencyConflict, StoredFailure, fingerprint, run_once
@@ -25,7 +26,7 @@ def test_retry_returns_saved_response_without_paying_again(conn, fund_shop):
     second, replayed2 = create_payout_idempotent(conn, "key-abc-123", 1, 9, 3_000)
     assert (replayed1, replayed2) == (False, True)
     assert first == second
-    assert conn.execute("SELECT COUNT(*) FROM payouts").fetchone()[0] == 1
+    assert scalar(conn, "SELECT COUNT(*) FROM payouts") == 1
     assert balance(conn, shop_wallet(1)) == 7_000
 
 
@@ -46,18 +47,18 @@ def test_failed_work_does_not_burn_the_key(conn, fund_shop):
     assert replayed is False and result["status"] == "queued"
 
 
-def test_five_simultaneous_retries_pay_once(db_path, conn, fund_shop):
+def test_five_simultaneous_retries_pay_once(dsn, conn, fund_shop):
     fund_shop(conn, 1, 10_000)
 
     def attempt(_):
-        with closing(connect(db_path)) as c:
+        with connect(dsn) as c:
             return create_payout_idempotent(c, "key-same-moment", 1, 9, 2_500)[0]
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         responses = list(pool.map(attempt, range(5)))
 
     assert all(r == responses[0] for r in responses)
-    assert conn.execute("SELECT COUNT(*) FROM payouts").fetchone()[0] == 1
+    assert scalar(conn, "SELECT COUNT(*) FROM payouts") == 1
     assert balance(conn, shop_wallet(1)) == 7_500
 
 
@@ -68,8 +69,8 @@ def test_run_once_rolls_back_work_and_key_together(conn):
 
     with pytest.raises(RuntimeError):
         run_once(conn, "key-crash-001", {"x": 1}, boom)
-    assert conn.execute("SELECT COUNT(*) FROM wallets WHERE id = 99").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM idempotency_keys").fetchone()[0] == 0
+    assert scalar(conn, "SELECT COUNT(*) FROM wallets WHERE id = 99") == 0
+    assert scalar(conn, "SELECT COUNT(*) FROM idempotency_keys") == 0
 
 
 def test_stripe_style_failures_are_replayed(conn, fund_shop):
@@ -83,4 +84,4 @@ def test_stripe_style_failures_are_replayed(conn, fund_shop):
         create_payout_idempotent(conn, "key-stored-fail", 1, 9, 5_000, store_failures=True)
     assert again.value.replayed is True
     assert again.value.response["error"] == "InsufficientFunds"
-    assert conn.execute("SELECT COUNT(*) FROM payouts").fetchone()[0] == 0
+    assert scalar(conn, "SELECT COUNT(*) FROM payouts") == 0

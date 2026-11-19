@@ -25,14 +25,13 @@ Rules this module teaches:
 
 from __future__ import annotations
 
-import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from .db import transaction
+from .db import Connection, transaction
 from .idempotency import run_once
-from .ledger import Posting, balance, post_entry, shop_wallet
+from .ledger import Posting, balance, lock_account, post_entry, shop_wallet
 from .outbox import enqueue
 from .provider import FakeProvider
 from .wallet import InsufficientFunds
@@ -63,49 +62,52 @@ class ManualReviewRequired(Exception):
     """Retrying now could pay twice. A human must check with the provider."""
 
 
-def get_payout(conn: sqlite3.Connection, payout_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM payouts WHERE id = ?", (payout_id,)).fetchone()
+def get_payout(conn: Connection, payout_id: int, for_update: bool = False) -> dict:
+    lock = " FOR UPDATE" if for_update else ""
+    row = conn.execute("SELECT * FROM payouts WHERE id = %s" + lock, (payout_id,)).fetchone()
     if row is None:
         raise PayoutNotFound(payout_id)
     return row
 
 
-def _as_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _as_dict(row: dict) -> dict[str, Any]:
     return {"payout_id": row["id"], "shop_id": row["shop_id"], "supplier_id": row["supplier_id"],
             "amount_paise": row["amount_paise"], "status": row["status"]}
 
 
-def create_payout(conn: sqlite3.Connection, shop_id: int, supplier_id: int,
+def create_payout(conn: Connection, shop_id: int, supplier_id: int,
                   amount_paise: int) -> dict[str, Any]:
     """Queue a payout and hold the money. Nothing is sent to the provider yet.
 
-    The balance check and the hold happen inside one write-locked transaction,
-    so two payouts can never both spend the same rupee.
+    The shop's wallet account row is locked first (SELECT ... FOR UPDATE), so
+    two payouts for the same shop queue up and can never both spend the same rupee.
     """
     if amount_paise <= 0:
         raise ValueError("payout amount must be positive")
     wallet = shop_wallet(shop_id)
     with transaction(conn):
+        lock_account(conn, wallet)
         available = balance(conn, wallet)
         if available < amount_paise:
             raise InsufficientFunds(f"shop {shop_id} has {available} paise, needs {amount_paise}")
         # Rule 1: one key per payout, created now, stored, reused on every attempt.
         provider_key = str(uuid.uuid4())
         payout_id = conn.execute(
-            "INSERT INTO payouts (shop_id, supplier_id, amount_paise, provider_key) VALUES (?, ?, ?, ?)",
+            "INSERT INTO payouts (shop_id, supplier_id, amount_paise, provider_key) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (shop_id, supplier_id, amount_paise, provider_key),
-        ).lastrowid
+        ).fetchone()["id"]
         post_entry(conn, f"Hold for payout {payout_id}", [
             Posting(wallet, amount_paise),                 # debit: MoneySafe owes the shop less
             Posting("payouts:in_flight", -amount_paise),   # credit: now owed to the payout
         ])
         conn.execute("INSERT INTO payout_events (payout_id, from_status, to_status, source) "
-                     "VALUES (?, 'new', 'queued', 'api')", (payout_id,))
+                     "VALUES (%s, 'new', 'queued', 'api')", (payout_id,))
         enqueue(conn, "payout.queued", {"payout_id": payout_id})
         return _as_dict(get_payout(conn, payout_id))
 
 
-def create_payout_idempotent(conn: sqlite3.Connection, key: str, shop_id: int, supplier_id: int,
+def create_payout_idempotent(conn: Connection, key: str, shop_id: int, supplier_id: int,
                              amount_paise: int, store_failures: bool = False
                              ) -> tuple[dict[str, Any], bool]:
     request = {"shop_id": shop_id, "supplier_id": supplier_id, "amount_paise": amount_paise}
@@ -114,22 +116,22 @@ def create_payout_idempotent(conn: sqlite3.Connection, key: str, shop_id: int, s
                     store_failures=(InsufficientFunds,) if store_failures else ())
 
 
-def transition(conn: sqlite3.Connection, payout_id: int, to_status: str, source: str) -> bool:
+def transition(conn: Connection, payout_id: int, to_status: str, source: str) -> bool:
     """Move a payout to a new status and move the money. False if already there."""
     with transaction(conn):
-        p = get_payout(conn, payout_id)
+        p = get_payout(conn, payout_id, for_update=True)
         if p["status"] == to_status:
             return False
         if to_status not in TRANSITIONS[p["status"]]:
             raise IllegalPayoutTransition(f"payout {payout_id}: {p['status']} -> {to_status}")
         updated = conn.execute(
-            "UPDATE payouts SET status = ?, version = version + 1 WHERE id = ? AND version = ?",
+            "UPDATE payouts SET status = %s, version = version + 1 WHERE id = %s AND version = %s",
             (to_status, payout_id, p["version"]),
         ).rowcount
         if updated == 0:
             raise IllegalPayoutTransition(f"payout {payout_id} changed underneath us")
         conn.execute(
-            "INSERT INTO payout_events (payout_id, from_status, to_status, source) VALUES (?, ?, ?, ?)",
+            "INSERT INTO payout_events (payout_id, from_status, to_status, source) VALUES (%s, %s, %s, %s)",
             (payout_id, p["status"], to_status, source),
         )
         _move_money(conn, p, to_status)
@@ -138,7 +140,7 @@ def transition(conn: sqlite3.Connection, payout_id: int, to_status: str, source:
     return True
 
 
-def _move_money(conn: sqlite3.Connection, p: sqlite3.Row, to_status: str) -> None:
+def _move_money(conn: Connection, p: dict, to_status: str) -> None:
     amount, wallet, pid = p["amount_paise"], shop_wallet(p["shop_id"]), p["id"]
     if to_status == "processing":
         post_entry(conn, f"Payout {pid} sent to provider", [
@@ -151,7 +153,7 @@ def _move_money(conn: sqlite3.Connection, p: sqlite3.Row, to_status: str) -> Non
             Posting("bank:main", amount), Posting(wallet, -amount)])
 
 
-def submit(conn: sqlite3.Connection, provider: FakeProvider, payout_id: int,
+def submit(conn: Connection, provider: FakeProvider, payout_id: int,
            now: datetime | None = None) -> dict[str, Any]:
     """Send a queued payout to the provider. Safe to call again after a timeout.
 
@@ -165,10 +167,10 @@ def submit(conn: sqlite3.Connection, provider: FakeProvider, payout_id: int,
 
     if p["first_submitted_at"] is None:
         with transaction(conn):
-            conn.execute("UPDATE payouts SET first_submitted_at = ? "
-                         "WHERE id = ? AND first_submitted_at IS NULL", (now.isoformat(), payout_id))
+            conn.execute("UPDATE payouts SET first_submitted_at = %s "
+                         "WHERE id = %s AND first_submitted_at IS NULL", (now, payout_id))
     else:
-        started = datetime.fromisoformat(p["first_submitted_at"])
+        started = p["first_submitted_at"]
         if now - started > provider.key_window - SAFETY_MARGIN:
             with transaction(conn):
                 enqueue(conn, "ops.manual_review", {
@@ -186,13 +188,13 @@ def submit(conn: sqlite3.Connection, provider: FakeProvider, payout_id: int,
     return _as_dict(get_payout(conn, payout_id))
 
 
-def _record_provider_ref(conn: sqlite3.Connection, payout_id: int, provider_ref: str) -> None:
+def _record_provider_ref(conn: Connection, payout_id: int, provider_ref: str) -> None:
     with transaction(conn):
-        conn.execute("UPDATE payouts SET provider_ref = ? WHERE id = ? AND provider_ref IS NULL",
+        conn.execute("UPDATE payouts SET provider_ref = %s WHERE id = %s AND provider_ref IS NULL",
                      (provider_ref, payout_id))
 
 
-def sync(conn: sqlite3.Connection, provider: FakeProvider, payout_id: int) -> dict[str, Any]:
+def sync(conn: Connection, provider: FakeProvider, payout_id: int) -> dict[str, Any]:
     """The right response to a "stuck" payout: ask the provider, never resend.
 
     A payout in deemed success stays in processing here too, until the provider
@@ -206,11 +208,11 @@ def sync(conn: sqlite3.Connection, provider: FakeProvider, payout_id: int) -> di
     return {**_as_dict(get_payout(conn, payout_id)), "remote": remote}
 
 
-def apply_remote_status(conn: sqlite3.Connection, payout_id: int, remote_status: str,
+def apply_remote_status(conn: Connection, payout_id: int, remote_status: str,
                         source: str) -> str:
     """Bring our payout up to the provider's status. Returns an outcome label."""
     with transaction(conn):
-        current = get_payout(conn, payout_id)["status"]
+        current = get_payout(conn, payout_id, for_update=True)["status"]
         if remote_status == current:
             return "no_change"
         if RANK[remote_status] < RANK[current]:
@@ -226,16 +228,16 @@ def apply_remote_status(conn: sqlite3.Connection, payout_id: int, remote_status:
     return "applied"
 
 
-def find_by_reference(conn: sqlite3.Connection, provider_ref: str, reference: str | None
-                      ) -> sqlite3.Row | None:
-    row = conn.execute("SELECT * FROM payouts WHERE provider_ref = ?", (provider_ref,)).fetchone()
+def find_by_reference(conn: Connection, provider_ref: str, reference: str | None
+                      ) -> dict | None:
+    row = conn.execute("SELECT * FROM payouts WHERE provider_ref = %s", (provider_ref,)).fetchone()
     if row is None and reference and reference.startswith("payout-"):
-        row = conn.execute("SELECT * FROM payouts WHERE id = ?",
+        row = conn.execute("SELECT * FROM payouts WHERE id = %s",
                            (int(reference.removeprefix("payout-")),)).fetchone()
     return row
 
 
-def history(conn: sqlite3.Connection, payout_id: int) -> list[dict[str, Any]]:
+def history(conn: Connection, payout_id: int) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT from_status, to_status, source, at FROM payout_events "
-                        "WHERE payout_id = ? ORDER BY id", (payout_id,)).fetchall()
+                        "WHERE payout_id = %s ORDER BY id", (payout_id,)).fetchall()
     return [dict(r) for r in rows]

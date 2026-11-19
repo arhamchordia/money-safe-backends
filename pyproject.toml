@@ -5,6 +5,7 @@ description = "Money-Safe Backends in Python: the MoneySafe reference codebase"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "psycopg[binary]>=3.1",
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]

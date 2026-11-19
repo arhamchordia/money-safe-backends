@@ -14,8 +14,8 @@ SECRET = "api-test-secret"
 
 
 @pytest.fixture
-def client(tmp_path):
-    app = create_app(db_path=str(tmp_path / "api.db"), webhook_secret=SECRET, platform_fee_bps=200)
+def client(dsn):
+    app = create_app(dsn=dsn, webhook_secret=SECRET, platform_fee_bps=200)
     with TestClient(app) as c:
         c.provider = app.state.provider
         yield c

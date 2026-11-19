@@ -4,13 +4,12 @@ Run it:   uvicorn moneysafe.api:create_app --factory --reload
 Docs:     http://localhost:8000/docs
 
 Endpoints are plain `def`, so FastAPI runs each one in a thread pool and each
-request opens its own SQLite connection.
+request opens its own Postgres connection (set MONEYSAFE_DSN).
 """
 
 from __future__ import annotations
 
 import os
-from contextlib import closing
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -33,22 +32,21 @@ class PayoutIn(BaseModel):
     amount_paise: int = Field(gt=0)
 
 
-def create_app(db_path: str | None = None, webhook_secret: str | None = None,
+def create_app(dsn: str | None = None, webhook_secret: str | None = None,
                platform_fee_bps: int | None = None, provider: FakeProvider | None = None) -> FastAPI:
-    db_path = db_path or os.environ.get("MONEYSAFE_DB", "moneysafe.db")
     secret = webhook_secret or os.environ.get("MONEYSAFE_WEBHOOK_SECRET", "dev-secret-change-me")
     fee_bps = (platform_fee_bps if platform_fee_bps is not None
                else int(os.environ.get("MONEYSAFE_PLATFORM_FEE_BPS", payments.DEFAULT_PLATFORM_FEE_BPS)))
     provider = provider or FakeProvider(secret=secret)
 
-    with closing(connect(db_path)) as conn:
+    with connect(dsn) as conn:
         init_db(conn)
 
     app = FastAPI(title="MoneySafe", description="Money-safe payments backend for kirana shops")
     app.state.provider = provider
 
     def db():
-        return closing(connect(db_path))
+        return connect(dsn)
 
     # Collections -------------------------------------------------------------------
 

@@ -2,15 +2,21 @@
 
 MoneySafe is a small payments backend for kirana shops, built to teach the parts of backend engineering where a bug costs real money: ledgers, concurrency, idempotency, payouts, webhooks and reconciliation.
 
-It uses only Python and SQLite, with an in-process fake payment provider, so it runs anywhere with no network access.
+It runs on Python 3.13 and PostgreSQL 16, with an in-process fake payment provider, so it needs no outside network.
 
 ## Quick start
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # the full test suite
-python scripts/double_charge_demo.py     # the race-condition demo
-uvicorn moneysafe.api:create_app --factory --reload   # the HTTP API, docs at /docs
+
+# Tests create a fresh copy of the database per test, so they need a role that can create databases
+export MONEYSAFE_ADMIN_DSN="postgresql://postgres@localhost/postgres"
+pytest
+
+# The demo and the API use one database
+export MONEYSAFE_DSN="postgresql://postgres@localhost/moneysafe"
+python scripts/double_charge_demo.py                    # the race-condition demo
+uvicorn moneysafe.api:create_app --factory --reload     # the HTTP API, docs at /docs
 ```
 
 ## Layout

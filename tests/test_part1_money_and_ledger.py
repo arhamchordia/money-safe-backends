@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 
 import pytest
+
+from conftest import scalar
 
 from moneysafe.ledger import (Posting, UnbalancedEntry, UnknownAccount, balance, open_shop,
                              post_entry, reverse_entry, shop_wallet, trial_balance,
@@ -77,13 +79,13 @@ def test_balanced_entry_is_written(conn):
 def test_unbalanced_entries_are_rejected_and_write_nothing(conn, postings):
     with pytest.raises(UnbalancedEntry):
         post_entry(conn, "bad", postings)
-    assert conn.execute("SELECT COUNT(*) FROM journal_entries").fetchone()[0] == 0
+    assert scalar(conn, "SELECT COUNT(*) FROM journal_entries") == 0
 
 
 def test_unknown_account_rolls_back_everything(conn):
     with pytest.raises(UnknownAccount):
         post_entry(conn, "typo", [Posting("provider:clearing", 100), Posting("shop:999:walet", -100)])
-    assert conn.execute("SELECT COUNT(*) FROM postings").fetchone()[0] == 0
+    assert scalar(conn, "SELECT COUNT(*) FROM postings") == 0
 
 
 def test_float_amounts_are_rejected(conn):
@@ -95,18 +97,28 @@ def test_float_amounts_are_rejected(conn):
 
 def test_ledger_rows_cannot_be_edited_or_deleted(conn, fund_shop):
     fund_shop(conn, 1, 5_000)
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+    with pytest.raises(psycopg.Error, match="append-only"):
         conn.execute("UPDATE postings SET amount_paise = 1")
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+    with pytest.raises(psycopg.Error, match="append-only"):
         conn.execute("DELETE FROM postings")
 
 
 def test_mistakes_are_fixed_with_a_reversal(conn, fund_shop):
     fund_shop(conn, 1, 5_000)
-    entry = conn.execute("SELECT MAX(id) FROM journal_entries").fetchone()[0]
+    entry = scalar(conn, "SELECT MAX(id) FROM journal_entries")
     reverse_entry(conn, entry, "reverse wrong funding")
     assert balance(conn, shop_wallet(1)) == 0
-    assert conn.execute("SELECT COUNT(*) FROM journal_entries").fetchone()[0] == 2  # history kept
+    assert scalar(conn, "SELECT COUNT(*) FROM journal_entries") == 2  # history kept
     assert balance(conn, shop_wallet(1), as_of_entry=entry) == 5_000               # point in time
     assert trial_balance(conn) == 0
     assert unbalanced_entries(conn) == []
+
+
+def test_database_itself_rejects_an_unbalanced_entry(conn):
+    """Even code that skips post_entry cannot commit books that do not balance."""
+    with pytest.raises(psycopg.Error, match="does not balance"):
+        with conn.transaction():
+            entry = conn.execute("INSERT INTO journal_entries (memo) VALUES ('sneaky') RETURNING id").fetchone()["id"]
+            conn.execute("INSERT INTO postings (entry_id, account_id, amount_paise) "
+                         "VALUES (%s, 'bank:main', 500)", (entry,))
+    assert scalar(conn, "SELECT COUNT(*) FROM journal_entries") == 0
